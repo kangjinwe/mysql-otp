@@ -50,7 +50,7 @@
 -include("server_status.hrl").
 
 %% Gen_server state
--record(state, {server_version, connection_id, socket, sockmod, tcp_opts, ssl_opts,
+-record(state, {opts,server_version, connection_id, socket, sockmod, tcp_opts, ssl_opts,
                 host, port, user, password, database, queries, prepares,
                 auth_plugin_name, auth_plugin_data, allowed_local_paths,
                 log_warnings, log_slow_queries,
@@ -98,7 +98,7 @@ init(Opts) ->
         N when N > 0 -> N
     end,
 
-    State0 = #state{
+    State0 = #state{opts = Opts,
         tcp_opts = TcpOpts,
         ssl_opts = SSLOpts,
         host = Host, port = Port,
@@ -290,13 +290,14 @@ execute_on_connect([Query|Queries], Prepares, State) ->
 %% </dl>
 handle_call(is_connected, _, #state{socket = Socket} = State) ->
     {reply, Socket =/= undefined, State};
-handle_call(Msg, From, #state{socket = undefined} = State) ->
-    case connect(State) of
-        {ok, State1} ->
-            handle_call(Msg, From, State1);
-        {error, _} = E ->
-            {stop, E, State}
-    end;
+handle_call(_Msg, _From, #state{socket = undefined} = State) ->
+    {reply,{error,not_connected},State};
+    %case connect(State) of
+    %    {ok, State1} ->
+    %        handle_call(Msg, From, State1);
+    %    {error, _} = E ->
+    %        {stop, E, State}
+    %end;
 handle_call({query, Query, FilterMap, Timeout}, _From, State) ->
     {Reply, State1} = query(Query, FilterMap, Timeout, State),
     {reply, Reply, State1};
@@ -491,18 +492,28 @@ handle_call(commit, {FromPid, _},
     {reply, ok, State1#state{transaction_levels = L}}.
 
 %% @private
-handle_cast(connect, #state{socket = undefined} = State) ->
-    case connect(State) of
-        {ok, State1} ->
-            {noreply, State1};
-        {error, _} = E ->
-            {stop, E, State}
-    end;
-handle_cast(connect, State) ->
-    {noreply, State};
+%handle_cast(connect, #state{socket = undefined} = State) ->
+%    case connect(State) of
+%        {ok, State1} ->
+%            {noreply, State1};
+%        {error, _} = E ->
+%            {stop, E, State}
+%    end;
+%handle_cast(connect, State) ->
+%    {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(reconnect, #state{socket = undefined,opts = Opts} = State) ->
+    case init(Opts) of
+        {ok, State1} ->
+            {noreply, State1};
+        _->
+            erlang:send_after(?default_connect_timeout,self(),reconnect),
+            {noreply,State}
+    end;
+handle_info(_Msg, #state{socket = undefined} = State) ->
+    {noreply,State};
 %% @private
 handle_info(query_cache, #state{query_cache = Cache,
                                 query_cache_time = CacheTime} = State) ->
@@ -527,8 +538,15 @@ handle_info(ping, #state{socket = Socket, sockmod = SockMod} = State) ->
     #ok{} = mysql_protocol:ping(SockMod, Socket),
     setopts(SockMod, Socket, [{active, once}]),
     {noreply, schedule_ping(State)};
-handle_info({tcp_closed, _Socket}, State) ->
-    {stop, normal, State#state{socket = undefined, connection_id = undefined}}; 
+handle_info({tcp_closed, Socket}, #state{ping_ref = PingRef} = State) ->
+    %% 断连，可能是mysql空闲连接超时，或mysqld关闭了
+    %% 1.清理
+    Socket=/=undefined andalso gen_tcp:close(Socket),
+    is_reference(PingRef) andalso erlang:cancel_timer(PingRef),
+    %% 2.隔段时间重连
+    handle_info(reconnect, State#state{socket = undefined});
+    %{stop, normal, State#state{socket = undefined, connection_id = undefined}};
+
 handle_info({tcp_error, _Socket, Reason}, State) ->
     stop_server({tcp_error, Reason}, State);
 handle_info(_Info, State) ->
