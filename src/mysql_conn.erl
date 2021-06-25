@@ -50,7 +50,7 @@
 -include("server_status.hrl").
 
 %% Gen_server state
--record(state, {server_version, connection_id, socket, sockmod, tcp_opts, ssl_opts,
+-record(state, {opts,server_version, connection_id, socket, sockmod, tcp_opts, ssl_opts,
                 host, port, user, password, database, queries, prepares,
                 auth_plugin_name, auth_plugin_data, allowed_local_paths,
                 log_warnings, log_slow_queries,
@@ -101,7 +101,7 @@ init(Opts) ->
         N when N > 0 -> N
     end,
 
-    State0 = #state{
+    State0 = #state{opts = Opts,
         tcp_opts = TcpOpts,
         ssl_opts = SSLOpts,
         host = Host, port = Port,
@@ -138,13 +138,17 @@ connect(#state{connect_timeout = ConnectTimeout} = State) ->
     MainPid = self(),
     Pid = spawn_link(
         fun () ->
-            {ok, State1}=connect_socket(State),
-            case handshake(State1) of
-                {ok, #state{sockmod = SockMod, socket = Socket} = State2} ->
-                    SockMod:controlling_process(Socket, MainPid),
-                    MainPid ! {self(), {ok, State2}};
-                {error, _} = E ->
-                    MainPid ! {self(), E}
+            case connect_socket(State) of
+                {ok, State1}->
+                    case handshake(State1) of
+                        {ok, #state{sockmod = SockMod, socket = Socket} = State2} ->
+                            SockMod:controlling_process(Socket, MainPid),
+                            MainPid ! {self(), {ok, State2}};
+                        {error, _} = E ->
+                            MainPid ! {self(), E}
+                    end;
+                Err->
+                    MainPid ! {self(), Err}
             end
         end
     ),
@@ -162,20 +166,25 @@ connect(#state{connect_timeout = ConnectTimeout} = State) ->
 connect_socket(#state{tcp_opts = TcpOpts, host = Host, port = Port} = State) ->
     %% Connect socket
     SockOpts = sanitize_tcp_opts(Host, TcpOpts),
-    {ok, Socket} = gen_tcp:connect(Host, Port, SockOpts),
+    case gen_tcp:connect(Host, Port, SockOpts) of
+        {ok, Socket} ->
+            case proplists:is_defined(buffer, TcpOpts) of
+                true ->
+                    ok;
+                false ->
+                    {ok, [{buffer, Buffer}]} = inet:getopts(Socket, [buffer]),
+                    {ok, [{recbuf, Recbuf}]} = inet:getopts(Socket, [recbuf]),
+                    ok = inet:setopts(Socket, [{buffer, max(Buffer, Recbuf)}])
+            end,
+
+            {ok, State#state{socket = Socket}};
+        Err->
+            Err
+    end.
 
     %% If buffer wasn't specifically defined make it at least as
     %% large as recbuf, as suggested by the inet:setopts() docs.
-    case proplists:is_defined(buffer, TcpOpts) of
-        true ->
-            ok;
-        false ->
-            {ok, [{buffer, Buffer}]} = inet:getopts(Socket, [buffer]),
-            {ok, [{recbuf, Recbuf}]} = inet:getopts(Socket, [recbuf]),
-            ok = inet:setopts(Socket, [{buffer, max(Buffer, Recbuf)}])
-    end,
 
-    {ok, State#state{socket = Socket}}.
 
 sanitize_tcp_opts(Host, [{inet_backend, _} = InetBackend | TcpOpts0]) ->
     %% This option is be used to turn on the experimental socket backend for
@@ -297,13 +306,14 @@ execute_on_connect([Query|Queries], Prepares, State) ->
 %% </dl>
 handle_call(is_connected, _, #state{socket = Socket} = State) ->
     {reply, Socket =/= undefined, State};
-handle_call(Msg, From, #state{socket = undefined} = State) ->
-    case connect(State) of
-        {ok, State1} ->
-            handle_call(Msg, From, State1);
-        {error, _} = E ->
-            {stop, E, State}
-    end;
+handle_call(_Msg, _From, #state{socket = undefined} = State) ->
+    {reply,{error,not_connected},State};
+    %case connect(State) of
+    %    {ok, State1} ->
+    %        handle_call(Msg, From, State1);
+    %    {error, _} = E ->
+    %        {stop, E, State}
+    %end;
 handle_call({query, _Query, _FilterMap, _Timeout}, {FromPid, _},
             State = #state{transaction_levels = [{OtherFromPid, _} | _]})
   when FromPid =/= OtherFromPid ->
@@ -522,18 +532,28 @@ handle_call(commit, {FromPid, _},
     {reply, ok, State1#state{transaction_levels = L}}.
 
 %% @private
-handle_cast(connect, #state{socket = undefined} = State) ->
-    case connect(State) of
-        {ok, State1} ->
-            {noreply, State1};
-        {error, _} = E ->
-            {stop, E, State}
-    end;
-handle_cast(connect, State) ->
-    {noreply, State};
+%handle_cast(connect, #state{socket = undefined} = State) ->
+%    case connect(State) of
+%        {ok, State1} ->
+%            {noreply, State1};
+%        {error, _} = E ->
+%            {stop, E, State}
+%    end;
+%handle_cast(connect, State) ->
+%    {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(reconnect, #state{socket = undefined,opts = Opts} = State) ->
+    case init(Opts) of
+        {ok, State1} ->
+            {noreply, State1};
+        _->
+            erlang:send_after(?default_connect_timeout,self(),reconnect),
+            {noreply,State}
+    end;
+handle_info(_Msg, #state{socket = undefined} = State) ->
+    {noreply,State};
 %% @private
 handle_info(query_cache, #state{query_cache = Cache,
                                 query_cache_time = CacheTime} = State) ->
@@ -558,8 +578,14 @@ handle_info(ping, #state{socket = Socket, sockmod = SockMod} = State) ->
     #ok{} = mysql_protocol:ping(SockMod, Socket),
     setopts(SockMod, Socket, [{active, once}]),
     {noreply, schedule_ping(State)};
-handle_info({tcp_closed, Socket}, #state{socket = Socket} = State) ->
-    {stop, tcp_closed, State#state{socket = undefined, connection_id = undefined}}; 
+handle_info({tcp_closed, Socket}, #state{ping_ref = PingRef} = State) ->
+    %% 断连，可能是mysql空闲连接超时，或mysqld关闭了
+    %% 1.清理
+    Socket=/=undefined andalso gen_tcp:close(Socket),
+    is_reference(PingRef) andalso erlang:cancel_timer(PingRef),
+    %% 2.隔段时间重连
+    handle_info(reconnect, State#state{socket = undefined});
+    %{stop, normal, State#state{socket = undefined, connection_id = undefined}};
 handle_info({ssl_closed, Socket}, #state{socket = Socket} = State) ->
     {stop, ssl_closed, State#state{socket = undefined, connection_id = undefined}}; 
 handle_info({tcp_error, Socket, Reason}, #state{socket = Socket} = State) ->
